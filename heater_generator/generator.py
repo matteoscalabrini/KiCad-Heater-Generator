@@ -305,8 +305,6 @@ def _sample_polyline(points: Sequence[Point], sample_step_mm: float) -> Iterable
 
 
 def _generate_raw_segments(params: HeaterParameters) -> List[PathSegment]:
-    if params.outline == "circle" and params.curve == "serpentine":
-        return _circle_serpentine_segments(params)
     if params.outline == "circle" and params.curve == "coil":
         return _arc_segments_from_points(_circle_spiral(params))
     return _segments_from_points(_generate_raw_points(params))
@@ -447,18 +445,6 @@ def _partial_segment(segment: PathSegment, ratio: float) -> PathSegment:
     return PathSegment("line", segment.start, end)
 
 
-def _arc_on_circle(start: Point, end: Point, center: Point) -> PathSegment:
-    radius = distance(start, center)
-    start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
-    end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
-    ccw_sweep = _positive_angle(end_angle - start_angle)
-    cw_sweep = -_positive_angle(start_angle - end_angle)
-    sweep = ccw_sweep if abs(ccw_sweep) <= abs(cw_sweep) else cw_sweep
-    mid_angle = start_angle + sweep / 2.0
-    mid = (center[0] + radius * math.cos(mid_angle), center[1] + radius * math.sin(mid_angle))
-    return PathSegment("arc", start, end, mid)
-
-
 def _arc_geometry(segment: PathSegment) -> Optional[Tuple[Point, float, float]]:
     if segment.mid is None:
         return None
@@ -593,53 +579,6 @@ def _circle_serpentine(params: HeaterParameters) -> List[Point]:
             points.append(row_points[0])
             points.append(row_points[1])
     return points
-
-
-def _circle_serpentine_segments(params: HeaterParameters) -> List[PathSegment]:
-    radius = params.width_mm / 2.0
-    center = (radius, radius)
-    usable_radius = radius - _edge_clearance(params)
-    if usable_radius <= 0:
-        return []
-
-    pitch = _pitch(params)
-    y_min = center[1] - usable_radius + pitch / 2.0
-    y_max = center[1] + usable_radius - pitch / 2.0
-    if y_max < y_min:
-        y_min = center[1]
-        y_max = center[1]
-
-    rows = max(1, int(math.floor((y_max - y_min) / pitch)) + 1)
-    segments: List[PathSegment] = []
-    previous_end: Optional[Point] = None
-
-    for row in range(rows):
-        y = min(y_min + row * pitch, y_max)
-        dy = y - center[1]
-        x_span = math.sqrt(max(usable_radius * usable_radius - dy * dy, 0.0))
-        if x_span <= params.track_width_mm * 0.25:
-            continue
-
-        left = (center[0] - x_span, y)
-        right = (center[0] + x_span, y)
-        if row % 2 == 0:
-            row_start, row_end = left, right
-        else:
-            row_start, row_end = right, left
-
-        if previous_end is not None and distance(previous_end, row_start) > 1e-6:
-            segments.append(_arc_on_circle(previous_end, row_start, center))
-
-        toward_center = -1.0 if y > center[1] else 1.0
-        if abs(y - center[1]) < 1e-6:
-            toward_center = 1.0 if row % 2 == 0 else -1.0
-        sagitta_room = max(usable_radius - abs(dy), pitch * 0.65)
-        sagitta = min(max(pitch * 0.65, x_span * 0.08), sagitta_room)
-        mid = (center[0], y + toward_center * sagitta)
-        segments.append(PathSegment("arc", row_start, row_end, mid))
-        previous_end = row_end
-
-    return segments
 
 
 def _rect_spiral(params: HeaterParameters) -> List[Point]:

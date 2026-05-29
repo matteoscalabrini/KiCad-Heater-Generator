@@ -66,10 +66,17 @@ class HeaterGeneratorTests(unittest.TestCase):
         )
         self.assertAlmostEqual(overflow, 1.0)
 
-    def test_circle_serpentine_uses_continuous_arcs(self):
+    def test_circle_serpentine_uses_straight_segments(self):
         result = generate_heater(HeaterParameters(outline="circle", curve="serpentine", trim_to_target=False))
         self.assertTrue(result.segments)
-        self.assertEqual(len(result.segments), sum(1 for segment in result.segments if segment.kind == "arc"))
+        self.assertFalse(any(segment.kind == "arc" for segment in result.segments))
+        self.assertTrue(segments_are_continuous(result.segments))
+        self.assertAlmostEqual(result.path_length_mm, path_segments_length(result.segments))
+
+    def test_circle_hilbert_uses_straight_segments(self):
+        result = generate_heater(HeaterParameters(outline="circle", curve="hilbert", trim_to_target=False))
+        self.assertTrue(result.segments)
+        self.assertFalse(any(segment.kind == "arc" for segment in result.segments))
         self.assertTrue(segments_are_continuous(result.segments))
         self.assertAlmostEqual(result.path_length_mm, path_segments_length(result.segments))
 
