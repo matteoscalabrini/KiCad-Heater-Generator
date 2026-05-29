@@ -2,13 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 COPPER_RESISTIVITY_OHM_M = 1.724e-8
 
 
 Point = Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class PathSegment:
+    kind: str
+    start: Point
+    end: Point
+    mid: Optional[Point] = None
 
 
 @dataclass
@@ -33,6 +41,8 @@ class HeaterResult:
     params: HeaterParameters
     points: List[Point]
     raw_points: List[Point]
+    segments: List[PathSegment]
+    raw_segments: List[PathSegment]
     target_resistance_ohm: float
     target_length_mm: float
     path_length_mm: float
@@ -110,22 +120,26 @@ def generate_heater(params: HeaterParameters) -> HeaterResult:
     target_r = target_resistance(p.voltage_v, p.wattage_w)
     target_len = length_for_resistance(target_r, p.track_width_mm, p.copper_thickness_um)
 
-    raw = _generate_raw_points(p)
-    raw = _dedupe_points(raw)
-    raw_len = polyline_length(raw)
+    raw_segments = _generate_raw_segments(p)
+    raw_segments = _dedupe_segments(raw_segments)
+    raw_len = path_segments_length(raw_segments)
 
-    if len(raw) < 2:
+    if not raw_segments:
         warnings.append("The selected geometry is too small for the requested trace width, clearance, and margin.")
-        points = raw
+        segments: List[PathSegment] = []
     elif p.trim_to_target and raw_len > target_len:
-        points = truncate_polyline(raw, target_len)
+        segments = truncate_segments(raw_segments, target_len)
     else:
-        points = raw
+        segments = raw_segments
 
-    path_len = polyline_length(points)
-    trace_overflow = outline_overflow_mm(points, p, p.track_width_mm)
+    points = path_points(segments)
+    raw_points = path_points(raw_segments)
+    path_len = path_segments_length(segments)
+    trace_overflow = outline_overflow_segments_mm(segments, p, p.track_width_mm)
     if trace_overflow > 0.001:
         warnings.append("Trace exceeds the heater outline by up to %.2f mm." % trace_overflow)
+    if segments and not segments_are_continuous(segments):
+        warnings.append("Generated route is not continuous; check the pattern settings.")
 
     actual_r = resistance_for_length(path_len, p.track_width_mm, p.copper_thickness_um) if path_len > 0 else 0.0
     actual_w = (p.voltage_v * p.voltage_v / actual_r) if actual_r > 0 else 0.0
@@ -141,7 +155,9 @@ def generate_heater(params: HeaterParameters) -> HeaterResult:
     return HeaterResult(
         params=p,
         points=points,
-        raw_points=raw,
+        raw_points=raw_points,
+        segments=segments,
+        raw_segments=raw_segments,
         target_resistance_ohm=target_r,
         target_length_mm=target_len,
         path_length_mm=path_len,
@@ -179,9 +195,9 @@ def _adaptive_fill_params(params: HeaterParameters) -> Tuple[HeaterParameters, L
                 clearance_mm=clearance,
                 trim_to_target=False,
             )
-            raw = _dedupe_points(_generate_raw_points(candidate))
-            path_len = polyline_length(raw)
-            if len(raw) < 2 or path_len <= 0:
+            raw_segments = _dedupe_segments(_generate_raw_segments(candidate))
+            path_len = path_segments_length(raw_segments)
+            if not raw_segments or path_len <= 0:
                 continue
 
             actual_r = resistance_for_length(path_len, width, candidate.copper_thickness_um)
@@ -237,11 +253,25 @@ def outline_overflow_mm(
 ) -> float:
     if not points:
         return 0.0
+    return _outline_overflow(_sample_polyline(points, sample_step_mm), params, stroke_width_mm)
 
+
+def outline_overflow_segments_mm(
+    segments: Sequence[PathSegment],
+    params: HeaterParameters,
+    stroke_width_mm: float,
+    sample_step_mm: float = 0.4,
+) -> float:
+    if not segments:
+        return 0.0
+    return _outline_overflow(sample_path_segments(segments, sample_step_mm), params, stroke_width_mm)
+
+
+def _outline_overflow(points: Iterable[Point], params: HeaterParameters, stroke_width_mm: float) -> float:
     p = normalize_params(params)
     stroke_radius = stroke_width_mm / 2.0
     max_overflow = 0.0
-    for point in _sample_polyline(points, sample_step_mm):
+    for point in points:
         if p.outline == "circle":
             radius = p.width_mm / 2.0
             center = (radius, radius)
@@ -272,6 +302,213 @@ def _sample_polyline(points: Sequence[Point], sample_step_mm: float) -> Iterable
                 start[1] + (end[1] - start[1]) * ratio,
             )
     yield points[-1]
+
+
+def _generate_raw_segments(params: HeaterParameters) -> List[PathSegment]:
+    if params.outline == "circle" and params.curve == "serpentine":
+        return _circle_serpentine_segments(params)
+    if params.outline == "circle" and params.curve == "coil":
+        return _arc_segments_from_points(_circle_spiral(params))
+    return _segments_from_points(_generate_raw_points(params))
+
+
+def _segments_from_points(points: Sequence[Point]) -> List[PathSegment]:
+    clean = _dedupe_points(points)
+    return [PathSegment("line", clean[idx - 1], clean[idx]) for idx in range(1, len(clean))]
+
+
+def _arc_segments_from_points(points: Sequence[Point]) -> List[PathSegment]:
+    clean = _dedupe_points(points)
+    segments: List[PathSegment] = []
+    idx = 0
+    while idx + 2 < len(clean):
+        start = clean[idx]
+        mid = clean[idx + 1]
+        end = clean[idx + 2]
+        if _arc_geometry(PathSegment("arc", start, end, mid)) is None:
+            segments.append(PathSegment("line", start, mid))
+            segments.append(PathSegment("line", mid, end))
+        else:
+            segments.append(PathSegment("arc", start, end, mid))
+        idx += 2
+
+    if idx + 1 < len(clean):
+        segments.append(PathSegment("line", clean[idx], clean[idx + 1]))
+    return segments
+
+
+def _dedupe_segments(segments: Iterable[PathSegment]) -> List[PathSegment]:
+    out: List[PathSegment] = []
+    for segment in segments:
+        if segment_length(segment) <= 1e-6:
+            continue
+        if out and distance(out[-1].end, segment.start) <= 1e-6:
+            out.append(segment)
+        else:
+            out.append(segment)
+    return out
+
+
+def path_points(segments: Sequence[PathSegment]) -> List[Point]:
+    if not segments:
+        return []
+    points = [segments[0].start]
+    points.extend(segment.end for segment in segments)
+    return _dedupe_points(points)
+
+
+def path_segments_length(segments: Sequence[PathSegment]) -> float:
+    return sum(segment_length(segment) for segment in segments)
+
+
+def segments_are_continuous(segments: Sequence[PathSegment], tolerance_mm: float = 1e-6) -> bool:
+    return all(distance(segments[idx - 1].end, segments[idx].start) <= tolerance_mm for idx in range(1, len(segments)))
+
+
+def segment_length(segment: PathSegment) -> float:
+    if segment.kind == "arc" and segment.mid is not None:
+        geometry = _arc_geometry(segment)
+        if geometry is not None:
+            _, radius, sweep = geometry
+            return abs(radius * sweep)
+    return distance(segment.start, segment.end)
+
+
+def truncate_segments(segments: Sequence[PathSegment], max_length_mm: float) -> List[PathSegment]:
+    if max_length_mm <= 0:
+        return []
+
+    out: List[PathSegment] = []
+    remaining = max_length_mm
+    for segment in segments:
+        seg_len = segment_length(segment)
+        if seg_len <= 1e-9:
+            continue
+        if seg_len <= remaining:
+            out.append(segment)
+            remaining -= seg_len
+            continue
+
+        ratio = remaining / seg_len
+        truncated = _partial_segment(segment, ratio)
+        if segment_length(truncated) > 1e-6:
+            out.append(truncated)
+        break
+
+    return out
+
+
+def sample_path_segments(segments: Sequence[PathSegment], sample_step_mm: float = 0.4) -> Iterable[Point]:
+    if not segments:
+        return
+
+    step = max(sample_step_mm, 0.05)
+    for segment in segments:
+        seg_len = segment_length(segment)
+        samples = max(1, int(math.ceil(seg_len / step)))
+        for sample_idx in range(samples):
+            yield point_on_segment(segment, sample_idx / samples)
+    yield segments[-1].end
+
+
+def translated_segments(segments: Sequence[PathSegment], dx: float, dy: float) -> List[PathSegment]:
+    return [
+        PathSegment(
+            segment.kind,
+            (segment.start[0] + dx, segment.start[1] + dy),
+            (segment.end[0] + dx, segment.end[1] + dy),
+            (segment.mid[0] + dx, segment.mid[1] + dy) if segment.mid is not None else None,
+        )
+        for segment in segments
+    ]
+
+
+def point_on_segment(segment: PathSegment, ratio: float) -> Point:
+    ratio = min(max(ratio, 0.0), 1.0)
+    if segment.kind == "arc" and segment.mid is not None:
+        geometry = _arc_geometry(segment)
+        if geometry is not None:
+            center, radius, sweep = geometry
+            start_angle = math.atan2(segment.start[1] - center[1], segment.start[0] - center[0])
+            angle = start_angle + sweep * ratio
+            return (center[0] + radius * math.cos(angle), center[1] + radius * math.sin(angle))
+
+    return (
+        segment.start[0] + (segment.end[0] - segment.start[0]) * ratio,
+        segment.start[1] + (segment.end[1] - segment.start[1]) * ratio,
+    )
+
+
+def _partial_segment(segment: PathSegment, ratio: float) -> PathSegment:
+    end = point_on_segment(segment, ratio)
+    if segment.kind == "arc" and segment.mid is not None:
+        mid = point_on_segment(segment, ratio / 2.0)
+        return PathSegment("arc", segment.start, end, mid)
+    return PathSegment("line", segment.start, end)
+
+
+def _arc_on_circle(start: Point, end: Point, center: Point) -> PathSegment:
+    radius = distance(start, center)
+    start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+    end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+    ccw_sweep = _positive_angle(end_angle - start_angle)
+    cw_sweep = -_positive_angle(start_angle - end_angle)
+    sweep = ccw_sweep if abs(ccw_sweep) <= abs(cw_sweep) else cw_sweep
+    mid_angle = start_angle + sweep / 2.0
+    mid = (center[0] + radius * math.cos(mid_angle), center[1] + radius * math.sin(mid_angle))
+    return PathSegment("arc", start, end, mid)
+
+
+def _arc_geometry(segment: PathSegment) -> Optional[Tuple[Point, float, float]]:
+    if segment.mid is None:
+        return None
+
+    center = _circle_center(segment.start, segment.mid, segment.end)
+    if center is None:
+        return None
+
+    radius = distance(center, segment.start)
+    if radius <= 1e-9:
+        return None
+
+    start_angle = math.atan2(segment.start[1] - center[1], segment.start[0] - center[0])
+    mid_angle = math.atan2(segment.mid[1] - center[1], segment.mid[0] - center[0])
+    end_angle = math.atan2(segment.end[1] - center[1], segment.end[0] - center[0])
+    ccw_sweep = _positive_angle(end_angle - start_angle)
+    mid_ccw = _positive_angle(mid_angle - start_angle)
+    if mid_ccw <= ccw_sweep:
+        sweep = ccw_sweep
+    else:
+        sweep = -_positive_angle(start_angle - end_angle)
+    if abs(sweep) <= 1e-9:
+        return None
+    return center, radius, sweep
+
+
+def _circle_center(a: Point, b: Point, c: Point) -> Optional[Point]:
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    denominator = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(denominator) <= 1e-9:
+        return None
+
+    ux = (
+        (ax * ax + ay * ay) * (by - cy)
+        + (bx * bx + by * by) * (cy - ay)
+        + (cx * cx + cy * cy) * (ay - by)
+    ) / denominator
+    uy = (
+        (ax * ax + ay * ay) * (cx - bx)
+        + (bx * bx + by * by) * (ax - cx)
+        + (cx * cx + cy * cy) * (bx - ax)
+    ) / denominator
+    return (ux, uy)
+
+
+def _positive_angle(angle: float) -> float:
+    wrapped = angle % (2.0 * math.pi)
+    return wrapped if wrapped >= 0.0 else wrapped + 2.0 * math.pi
 
 
 def _generate_raw_points(params: HeaterParameters) -> List[Point]:
@@ -356,6 +593,53 @@ def _circle_serpentine(params: HeaterParameters) -> List[Point]:
             points.append(row_points[0])
             points.append(row_points[1])
     return points
+
+
+def _circle_serpentine_segments(params: HeaterParameters) -> List[PathSegment]:
+    radius = params.width_mm / 2.0
+    center = (radius, radius)
+    usable_radius = radius - _edge_clearance(params)
+    if usable_radius <= 0:
+        return []
+
+    pitch = _pitch(params)
+    y_min = center[1] - usable_radius + pitch / 2.0
+    y_max = center[1] + usable_radius - pitch / 2.0
+    if y_max < y_min:
+        y_min = center[1]
+        y_max = center[1]
+
+    rows = max(1, int(math.floor((y_max - y_min) / pitch)) + 1)
+    segments: List[PathSegment] = []
+    previous_end: Optional[Point] = None
+
+    for row in range(rows):
+        y = min(y_min + row * pitch, y_max)
+        dy = y - center[1]
+        x_span = math.sqrt(max(usable_radius * usable_radius - dy * dy, 0.0))
+        if x_span <= params.track_width_mm * 0.25:
+            continue
+
+        left = (center[0] - x_span, y)
+        right = (center[0] + x_span, y)
+        if row % 2 == 0:
+            row_start, row_end = left, right
+        else:
+            row_start, row_end = right, left
+
+        if previous_end is not None and distance(previous_end, row_start) > 1e-6:
+            segments.append(_arc_on_circle(previous_end, row_start, center))
+
+        toward_center = -1.0 if y > center[1] else 1.0
+        if abs(y - center[1]) < 1e-6:
+            toward_center = 1.0 if row % 2 == 0 else -1.0
+        sagitta_room = max(usable_radius - abs(dy), pitch * 0.65)
+        sagitta = min(max(pitch * 0.65, x_span * 0.08), sagitta_room)
+        mid = (center[0], y + toward_center * sagitta)
+        segments.append(PathSegment("arc", row_start, row_end, mid))
+        previous_end = row_end
+
+    return segments
 
 
 def _rect_spiral(params: HeaterParameters) -> List[Point]:

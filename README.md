@@ -10,6 +10,8 @@ The plugin computes the required resistance as `R = V^2 / P`, then estimates cop
 - `Adaptive fill` treats trace width and clearance as minimum manufacturable values. It searches for a width/clearance combination that fills the whole selected outline and gets as close as possible to the requested resistance.
 - `Outline fit` reports whether the copper trace or terminal pads exceed the selected heater outline. The preview outline turns red if there is spill outside the constraint.
 - `Terminal pad side` controls whether the end pads sit inside the heater path, centered on the path endpoint, or outside the endpoint.
+- Circle serpentine and coil patterns are emitted as KiCad copper arc segments where possible, with shared endpoints so the route remains continuous.
+- `Terminal vias` adds through-vias at both heater endpoints using the configured via diameter and drill.
 
 ## Install
 

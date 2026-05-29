@@ -5,7 +5,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import wx
 
-from .generator import HeaterParameters, HeaterResult, generate_heater, outline_overflow_mm, translated
+from .generator import (
+    HeaterParameters,
+    HeaterResult,
+    generate_heater,
+    outline_overflow_mm,
+    sample_path_segments,
+    translated,
+    translated_segments,
+)
 
 
 class PreviewPanel(wx.Panel):
@@ -14,6 +22,8 @@ class PreviewPanel(wx.Panel):
         self.result: Optional[HeaterResult] = None
         self.terminal_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
         self.terminal_width_mm = 0.0
+        self.via_points: List[Tuple[float, float]] = []
+        self.via_diameter_mm = 0.0
         self.overflow_mm = 0.0
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_PAINT, self.on_paint)
@@ -23,11 +33,15 @@ class PreviewPanel(wx.Panel):
         result: HeaterResult,
         terminal_segments: Sequence[Tuple[Tuple[float, float], Tuple[float, float]]],
         terminal_width_mm: float,
+        via_points: Sequence[Tuple[float, float]],
+        via_diameter_mm: float,
         overflow_mm: float,
     ):
         self.result = result
         self.terminal_segments = list(terminal_segments)
         self.terminal_width_mm = terminal_width_mm
+        self.via_points = list(via_points)
+        self.via_diameter_mm = via_diameter_mm
         self.overflow_mm = overflow_mm
         self.Refresh()
 
@@ -61,7 +75,7 @@ class PreviewPanel(wx.Panel):
         else:
             dc.DrawRectangle(int(ox), int(oy), int(params.width_mm * scale), int(params.height_mm * scale))
 
-        points = result.points
+        points = list(sample_path_segments(result.segments, 0.35))
         if len(points) >= 2:
             trace_px = max(2, int(params.track_width_mm * scale))
             dc.SetPen(wx.Pen(wx.Colour(184, 94, 29), trace_px, wx.PENSTYLE_SOLID))
@@ -74,11 +88,24 @@ class PreviewPanel(wx.Panel):
                 for start, end in self.terminal_segments:
                     dc.DrawLine(tx(start), tx(end))
 
+            if self.via_points:
+                via_px = max(trace_px + 4, int(self.via_diameter_mm * scale))
+                dc.SetPen(wx.Pen(wx.Colour(28, 84, 150), 1, wx.PENSTYLE_SOLID))
+                dc.SetBrush(wx.Brush(wx.Colour(74, 138, 207)))
+                for point in self.via_points:
+                    center = tx(point)
+                    dc.DrawEllipse(
+                        int(center.x - via_px / 2),
+                        int(center.y - via_px / 2),
+                        via_px,
+                        via_px,
+                    )
+
         if result.warnings or self.overflow_mm > 0.001:
             dc.SetTextForeground(wx.Colour(160, 70, 20))
         else:
             dc.SetTextForeground(wx.Colour(60, 60, 60))
-        dc.DrawText("%d points, %.1f mm" % (len(points), result.path_length_mm), 12, 8)
+        dc.DrawText("%d segments, %.1f mm" % (len(result.segments), result.path_length_mm), 12, 8)
 
 
 class HeaterDialog(wx.Dialog):
@@ -99,6 +126,8 @@ class HeaterDialog(wx.Dialog):
         self.latest_result: Optional[HeaterResult] = None
         self.latest_terminal_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
         self.latest_terminal_overflow_mm = 0.0
+        self.latest_via_points: List[Tuple[float, float]] = []
+        self.latest_via_overflow_mm = 0.0
 
         root = wx.BoxSizer(wx.VERTICAL)
         body = wx.BoxSizer(wx.HORIZONTAL)
@@ -123,6 +152,9 @@ class HeaterDialog(wx.Dialog):
         self._add_choice(form, "Net", "net", [name for name, _ in self.net_choices], 0)
         self._add_check(form, "Terminal pads", "terminal_pads", True)
         self._add_choice(form, "Terminal pad side", "terminal_pad_side", ["Inside", "Centered", "Outside"], 0)
+        self._add_check(form, "Terminal vias", "terminal_vias", True)
+        self._add_float(form, "Via diameter (mm)", "via_diameter_mm", 1.4)
+        self._add_float(form, "Via drill (mm)", "via_drill_mm", 0.7)
         self._add_check(form, "Trim to target", "trim_to_target", True)
 
         left = wx.BoxSizer(wx.VERTICAL)
@@ -224,7 +256,7 @@ class HeaterDialog(wx.Dialog):
 
         inserted_count = self._insert_result(result)
         wx.MessageBox(
-            "Inserted %d heater track segments on %s."
+            "Inserted %d heater route items on %s."
             % (inserted_count, self._selected_layer_name()),
             "PCB Heater Generator",
             wx.OK | wx.ICON_INFORMATION,
@@ -243,13 +275,19 @@ class HeaterDialog(wx.Dialog):
         self.latest_result = result
         terminal_width = self._terminal_width(result)
         terminal_segments = self._terminal_segments(result.points)
+        via_diameter = self._via_diameter()
+        via_points = self._terminal_via_points(result.points)
         self.latest_terminal_segments = terminal_segments
         self.latest_terminal_overflow_mm = self._terminal_overflow(result, terminal_segments, terminal_width)
+        self.latest_via_points = via_points
+        self.latest_via_overflow_mm = self._via_overflow(result, via_points, via_diameter)
         self.preview.set_preview(
             result,
             terminal_segments,
             terminal_width,
-            max(result.trace_overflow_mm, self.latest_terminal_overflow_mm),
+            via_points,
+            via_diameter,
+            max(result.trace_overflow_mm, self.latest_terminal_overflow_mm, self.latest_via_overflow_mm),
         )
         self.metrics.SetLabel(self._metrics_text(result))
         return result
@@ -287,12 +325,19 @@ class HeaterDialog(wx.Dialog):
 
     def _metrics_text(self, result: HeaterResult):
         fit_line = "Outline fit: OK"
-        if self.latest_terminal_overflow_mm > 0.001 or result.trace_overflow_mm > 0.001:
+        max_overflow = max(
+            self.latest_terminal_overflow_mm,
+            self.latest_via_overflow_mm,
+            result.trace_overflow_mm,
+        )
+        if max_overflow > 0.001:
             fit_line = "Outline fit: exceeds by %.2f mm" % max(
                 self.latest_terminal_overflow_mm,
+                self.latest_via_overflow_mm,
                 result.trace_overflow_mm,
             )
 
+        arc_count = sum(1 for segment in result.segments if segment.kind == "arc")
         lines = [
             "Target: %.3f ohm, %.1f mm trace" % (result.target_resistance_ohm, result.target_length_mm),
             "Generated: %.3f ohm, %.2f W, %.3f A" % (result.resistance_ohm, result.wattage_w, result.current_a),
@@ -300,11 +345,14 @@ class HeaterDialog(wx.Dialog):
                 result.params.track_width_mm,
                 result.params.clearance_mm,
             ),
-            "Length: %.1f mm across %d points" % (result.path_length_mm, len(result.points)),
+            "Route: %d joined segments, %d arcs" % (len(result.segments), arc_count),
+            "Length: %.1f mm" % result.path_length_mm,
             fit_line,
         ]
         if self.latest_terminal_overflow_mm > 0.001:
             lines.append("Terminal pads exceed the outline by up to %.2f mm." % self.latest_terminal_overflow_mm)
+        if self.latest_via_overflow_mm > 0.001:
+            lines.append("Terminal vias exceed the outline by up to %.2f mm." % self.latest_via_overflow_mm)
         lines.extend(result.warnings)
         return "\n".join(lines)
 
@@ -324,6 +372,9 @@ class HeaterDialog(wx.Dialog):
         self.controls["trim_to_target"].SetToolTip(
             "Disabled in adaptive fill because adaptive mode uses the full outline."
         )
+        terminal_vias = self.controls["terminal_vias"].GetValue()
+        self.controls["via_diameter_mm"].Enable(terminal_vias)
+        self.controls["via_drill_mm"].Enable(terminal_vias)
 
         notes = []
         if not height_enabled:
@@ -385,14 +436,15 @@ class HeaterDialog(wx.Dialog):
         origin_x = self._float_value("origin_x_mm")
         origin_y = self._float_value("origin_y_mm")
         points = translated(result.points, origin_x, origin_y)
+        segments = translated_segments(result.segments, origin_x, origin_y)
 
         layer = self._selected_layer()
         net = self._selected_net()
         width_iu = self.pcbnew.FromMM(result.params.track_width_mm)
         inserted = 0
 
-        for idx in range(1, len(points)):
-            if self._add_track(points[idx - 1], points[idx], width_iu, layer, net):
+        for segment in segments:
+            if self._add_route_segment(segment, width_iu, layer, net):
                 inserted += 1
 
         if self.controls["terminal_pads"].GetValue():
@@ -401,12 +453,24 @@ class HeaterDialog(wx.Dialog):
                 if self._add_track(segment[0], segment[1], terminal_width, layer, net):
                     inserted += 1
 
+        if self.controls["terminal_vias"].GetValue():
+            via_diameter = self._via_diameter()
+            via_drill = self._via_drill(via_diameter)
+            for point in self._terminal_via_points(points):
+                if self._add_via(point, via_diameter, via_drill, net):
+                    inserted += 1
+
         try:
             self.board.BuildConnectivity()
         except Exception:
             pass
         self.pcbnew.Refresh()
         return inserted
+
+    def _add_route_segment(self, segment, width_iu, layer, net):
+        if segment.kind == "arc" and segment.mid is not None:
+            return self._add_arc(segment, width_iu, layer, net)
+        return self._add_track(segment.start, segment.end, width_iu, layer, net)
 
     def _add_track(self, start, end, width_iu, layer, net):
         if math.hypot(end[0] - start[0], end[1] - start[1]) < 0.001:
@@ -419,6 +483,37 @@ class HeaterDialog(wx.Dialog):
         if net is not None:
             track.SetNet(net)
         self.board.Add(track)
+        return True
+
+    def _add_arc(self, segment, width_iu, layer, net):
+        if segment.mid is None or math.hypot(
+            segment.end[0] - segment.start[0],
+            segment.end[1] - segment.start[1],
+        ) < 0.001:
+            return False
+        arc = self.pcbnew.PCB_ARC(self.board)
+        arc.SetStart(self._vector(segment.start))
+        arc.SetMid(self._vector(segment.mid))
+        arc.SetEnd(self._vector(segment.end))
+        arc.SetWidth(width_iu)
+        arc.SetLayer(layer)
+        if net is not None:
+            arc.SetNet(net)
+        self.board.Add(arc)
+        return True
+
+    def _add_via(self, point, diameter_mm, drill_mm, net):
+        via = self.pcbnew.PCB_VIA(self.board)
+        via.SetPosition(self._vector(point))
+        via.SetWidth(self.pcbnew.FromMM(diameter_mm))
+        via.SetDrill(self.pcbnew.FromMM(drill_mm))
+        try:
+            via.SetLayerPair(self.pcbnew.F_Cu, self.pcbnew.B_Cu)
+        except Exception:
+            pass
+        if net is not None:
+            via.SetNet(net)
+        self.board.Add(via)
         return True
 
     def _vector(self, point):
@@ -444,6 +539,23 @@ class HeaterDialog(wx.Dialog):
         overflow = 0.0
         for start, end in terminal_segments:
             overflow = max(overflow, outline_overflow_mm([start, end], result.params, terminal_width_mm))
+        return overflow
+
+    def _terminal_via_points(self, points):
+        if not self.controls["terminal_vias"].GetValue() or len(points) < 2:
+            return []
+        return [points[0], points[-1]]
+
+    def _via_diameter(self):
+        return max(self._float_value("via_diameter_mm"), 0.1)
+
+    def _via_drill(self, via_diameter_mm):
+        return min(max(self._float_value("via_drill_mm"), 0.05), max(via_diameter_mm - 0.05, 0.05))
+
+    def _via_overflow(self, result: HeaterResult, via_points, via_diameter_mm):
+        overflow = 0.0
+        for point in via_points:
+            overflow = max(overflow, outline_overflow_mm([point], result.params, via_diameter_mm))
         return overflow
 
 
