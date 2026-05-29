@@ -1,6 +1,6 @@
 import unittest
 
-from heater_generator.generator import HeaterParameters, generate_heater, polyline_length
+from heater_generator.generator import HeaterParameters, generate_heater, outline_overflow_mm, polyline_length
 
 
 class HeaterGeneratorTests(unittest.TestCase):
@@ -44,6 +44,20 @@ class HeaterGeneratorTests(unittest.TestCase):
         short = generate_heater(HeaterParameters(**{**base.__dict__, "hilbert_order": 2}))
         long = generate_heater(HeaterParameters(**{**base.__dict__, "hilbert_order": 4}))
         self.assertGreater(long.path_length_mm, short.path_length_mm)
+
+    def test_adaptive_fill_adjusts_clearance_to_match_target(self):
+        result = generate_heater(HeaterParameters(adaptive_fill=True))
+        self.assertAlmostEqual(result.wattage_w, result.params.wattage_w, delta=0.2)
+        self.assertGreaterEqual(result.params.track_width_mm, 0.25)
+        self.assertGreaterEqual(result.params.clearance_mm, 0.25)
+
+    def test_outline_overflow_reports_stroke_spill(self):
+        overflow = outline_overflow_mm(
+            [(0.0, 5.0), (10.0, 5.0)],
+            HeaterParameters(width_mm=10.0, height_mm=10.0),
+            2.0,
+        )
+        self.assertAlmostEqual(overflow, 1.0)
 
 
 if __name__ == "__main__":

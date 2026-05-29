@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Iterable, List, Sequence, Tuple
 
@@ -25,6 +25,7 @@ class HeaterParameters:
     margin_mm: float = 1.0
     hilbert_order: int = 4
     trim_to_target: bool = True
+    adaptive_fill: bool = False
 
 
 @dataclass
@@ -38,6 +39,7 @@ class HeaterResult:
     resistance_ohm: float
     wattage_w: float
     current_a: float
+    trace_overflow_mm: float = 0.0
     warnings: List[str] = field(default_factory=list)
 
 
@@ -65,6 +67,7 @@ def normalize_params(params: HeaterParameters) -> HeaterParameters:
         margin_mm=max(float(params.margin_mm), 0.0),
         hilbert_order=min(max(int(params.hilbert_order), 1), 8),
         trim_to_target=bool(params.trim_to_target),
+        adaptive_fill=bool(params.adaptive_fill),
     )
 
 
@@ -100,6 +103,10 @@ def generate_heater(params: HeaterParameters) -> HeaterResult:
     p = normalize_params(params)
     warnings: List[str] = []
 
+    if p.adaptive_fill:
+        p, adaptive_warnings = _adaptive_fill_params(p)
+        warnings.extend(adaptive_warnings)
+
     target_r = target_resistance(p.voltage_v, p.wattage_w)
     target_len = length_for_resistance(target_r, p.track_width_mm, p.copper_thickness_um)
 
@@ -116,15 +123,20 @@ def generate_heater(params: HeaterParameters) -> HeaterResult:
         points = raw
 
     path_len = polyline_length(points)
-    if path_len + 0.001 < target_len:
-        warnings.append(
-            "The layout can only fit %.2f mm of trace, below the %.2f mm needed for the target power."
-            % (path_len, target_len)
-        )
+    trace_overflow = outline_overflow_mm(points, p, p.track_width_mm)
+    if trace_overflow > 0.001:
+        warnings.append("Trace exceeds the heater outline by up to %.2f mm." % trace_overflow)
 
     actual_r = resistance_for_length(path_len, p.track_width_mm, p.copper_thickness_um) if path_len > 0 else 0.0
     actual_w = (p.voltage_v * p.voltage_v / actual_r) if actual_r > 0 else 0.0
     actual_i = (p.voltage_v / actual_r) if actual_r > 0 else 0.0
+    resistance_error = abs(actual_r - target_r) / target_r if target_r > 0 else 0.0
+
+    if path_len + 0.001 < target_len and (not p.adaptive_fill or resistance_error > 0.02):
+        warnings.append(
+            "The layout can only fit %.2f mm of trace, below the %.2f mm needed for the target power."
+            % (path_len, target_len)
+        )
 
     return HeaterResult(
         params=p,
@@ -136,8 +148,130 @@ def generate_heater(params: HeaterParameters) -> HeaterResult:
         resistance_ohm=actual_r,
         wattage_w=actual_w,
         current_a=actual_i,
+        trace_overflow_mm=trace_overflow,
         warnings=warnings,
     )
+
+
+def _adaptive_fill_params(params: HeaterParameters) -> Tuple[HeaterParameters, List[str]]:
+    warnings: List[str] = []
+    target_r = target_resistance(params.voltage_v, params.wattage_w)
+    usable_min = _minimum_usable_span(params)
+    min_width = max(params.track_width_mm, 0.05)
+    min_clearance = max(params.clearance_mm, 0.05)
+
+    if usable_min <= min_width:
+        warnings.append("Adaptive fill cannot run because the requested outline is too small.")
+        return replace(params, trim_to_target=False), warnings
+
+    max_width = max(min_width, usable_min * 0.45)
+    max_clearance = max(min_clearance, usable_min * 0.35)
+    width_values = _sample_range(min_width, max_width, 56)
+    clearance_values = _sample_range(min_clearance, max_clearance, 36)
+
+    best = None
+    best_candidate = params
+    for width in width_values:
+        for clearance in clearance_values:
+            candidate = replace(
+                params,
+                track_width_mm=width,
+                clearance_mm=clearance,
+                trim_to_target=False,
+            )
+            raw = _dedupe_points(_generate_raw_points(candidate))
+            path_len = polyline_length(raw)
+            if len(raw) < 2 or path_len <= 0:
+                continue
+
+            actual_r = resistance_for_length(path_len, width, candidate.copper_thickness_um)
+            if actual_r <= 0:
+                continue
+
+            error = abs(math.log(actual_r / target_r))
+            clearance_ratio = clearance / max(width, 0.001)
+            fit_penalty = 0.002 * clearance_ratio
+            score = error + fit_penalty
+            item = (score, error, -path_len, width, clearance)
+            if best is None or item < best:
+                best = item
+                best_candidate = candidate
+
+    if best is None:
+        warnings.append("Adaptive fill could not find a trace width and clearance that fit the outline.")
+        return replace(params, trim_to_target=False), warnings
+
+    _, error, _, _, _ = best
+    relative_error = abs(math.exp(error) - 1.0)
+    if relative_error > 0.05:
+        warnings.append(
+            "Adaptive fill closest match is %.1f%% away from the requested resistance."
+            % (relative_error * 100.0)
+        )
+
+    return best_candidate, warnings
+
+
+def _minimum_usable_span(params: HeaterParameters) -> float:
+    if params.outline == "circle":
+        return max(params.width_mm - 2.0 * params.margin_mm, 0.0)
+    return max(min(params.width_mm, params.height_mm) - 2.0 * params.margin_mm, 0.0)
+
+
+def _sample_range(minimum: float, maximum: float, count: int) -> List[float]:
+    if count <= 1 or maximum <= minimum:
+        return [minimum]
+
+    values = []
+    for idx in range(count):
+        ratio = (idx / (count - 1)) ** 2
+        values.append(minimum + (maximum - minimum) * ratio)
+    return values
+
+
+def outline_overflow_mm(
+    points: Sequence[Point],
+    params: HeaterParameters,
+    stroke_width_mm: float,
+    sample_step_mm: float = 0.4,
+) -> float:
+    if not points:
+        return 0.0
+
+    p = normalize_params(params)
+    stroke_radius = stroke_width_mm / 2.0
+    max_overflow = 0.0
+    for point in _sample_polyline(points, sample_step_mm):
+        if p.outline == "circle":
+            radius = p.width_mm / 2.0
+            center = (radius, radius)
+            inside_distance = radius - distance(center, point)
+        else:
+            x, y = point
+            inside_distance = min(x, y, p.width_mm - x, p.height_mm - y)
+        max_overflow = max(max_overflow, stroke_radius - inside_distance)
+
+    return max(max_overflow, 0.0)
+
+
+def _sample_polyline(points: Sequence[Point], sample_step_mm: float) -> Iterable[Point]:
+    if len(points) == 1:
+        yield points[0]
+        return
+
+    step = max(sample_step_mm, 0.05)
+    for idx in range(1, len(points)):
+        start = points[idx - 1]
+        end = points[idx]
+        seg_len = distance(start, end)
+        samples = max(1, int(math.ceil(seg_len / step)))
+        for sample_idx in range(samples):
+            ratio = sample_idx / samples
+            yield (
+                start[0] + (end[0] - start[0]) * ratio,
+                start[1] + (end[1] - start[1]) * ratio,
+            )
+    yield points[-1]
 
 
 def _generate_raw_points(params: HeaterParameters) -> List[Point]:
