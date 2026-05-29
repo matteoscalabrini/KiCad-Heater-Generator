@@ -4,6 +4,8 @@ KiCad 9 PCB editor action plugin for generating PCB copper heater traces from vo
 
 The plugin computes the target resistance as `R = V^2 / P`, estimates the required copper length from trace width and copper thickness, and generates a previewable heater pattern before inserting it into the PCB.
 
+<img src="Plugin_Homescreen.png" alt="PCB Heater Generator plugin dialog in KiCad" width="900">
+
 ## Features
 
 - Generates serpentine, coil/spiral, and Hilbert-style heater traces.
