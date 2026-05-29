@@ -7,9 +7,11 @@ The plugin computes the required resistance as `R = V^2 / P`, then estimates cop
 ## Controls
 
 - `Height` is used only for rectangle outlines. Square and circle outlines lock height to the width/diameter value, and the dialog disables the height field to make that clear.
+- `Copper thickness` can be entered in oz or um. The dialog converts the displayed value when the unit selector changes and always computes with micrometers internally.
 - `Adaptive fill` treats trace width and clearance as minimum manufacturable values. It searches for a width/clearance combination that fills the whole selected outline and gets as close as possible to the requested resistance.
+- Adaptive fill results are shown in the status banner and metrics so the selected width/clearance are visible without changing the minimum inputs.
 - `Outline fit` reports whether the copper trace or terminal pads exceed the selected heater outline. The preview outline turns red if there is spill outside the constraint.
-- `Terminal pad side` controls whether the end pads sit inside the heater path, centered on the path endpoint, or outside the endpoint.
+- `Terminal pad side`, `Pad shape`, `Pad width`, and `Pad length` control whether the end pads sit inside the heater path, centered on the path endpoint, or outside the endpoint, and whether they are oval, round, or rectangular.
 - Circle coil patterns are emitted as KiCad copper arc segments where possible, with shared endpoints so the route remains continuous. Serpentine and Hilbert routes stay as straight segments.
 - `Terminal vias` adds through-vias at both heater endpoints using the configured via diameter and drill.
 

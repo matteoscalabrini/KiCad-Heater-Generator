@@ -2,6 +2,8 @@ import unittest
 
 from heater_generator.generator import (
     HeaterParameters,
+    copper_oz_to_um,
+    copper_um_to_oz,
     generate_heater,
     outline_overflow_mm,
     path_segments_length,
@@ -65,6 +67,10 @@ class HeaterGeneratorTests(unittest.TestCase):
             2.0,
         )
         self.assertAlmostEqual(overflow, 1.0)
+
+    def test_copper_thickness_converts_ounces_and_micrometers(self):
+        self.assertAlmostEqual(copper_oz_to_um(1.0), 34.798)
+        self.assertAlmostEqual(copper_um_to_oz(34.798), 1.0)
 
     def test_circle_serpentine_uses_straight_segments(self):
         result = generate_heater(HeaterParameters(outline="circle", curve="serpentine", trim_to_target=False))

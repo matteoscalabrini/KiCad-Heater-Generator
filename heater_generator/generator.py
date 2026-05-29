@@ -6,6 +6,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 COPPER_RESISTIVITY_OHM_M = 1.724e-8
+COPPER_UM_PER_OZ = 34.798
 
 
 Point = Tuple[float, float]
@@ -83,6 +84,14 @@ def normalize_params(params: HeaterParameters) -> HeaterParameters:
 
 def target_resistance(voltage_v: float, wattage_w: float) -> float:
     return voltage_v * voltage_v / wattage_w
+
+
+def copper_oz_to_um(ounces: float) -> float:
+    return max(float(ounces), 0.0) * COPPER_UM_PER_OZ
+
+
+def copper_um_to_oz(micrometers: float) -> float:
+    return max(float(micrometers), 0.0) / COPPER_UM_PER_OZ
 
 
 def resistance_for_length(
