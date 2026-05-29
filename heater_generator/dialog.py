@@ -130,7 +130,7 @@ class HeaterDialog(wx.Dialog):
         super().__init__(
             parent,
             title="PCB Heater Generator",
-            size=(900, 610),
+            size=(940, 680),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
         self.pcbnew = pcbnew_module
@@ -168,7 +168,9 @@ class HeaterDialog(wx.Dialog):
         self._add_float(form, "Board X (mm)", "origin_x_mm", 20.0)
         self._add_float(form, "Board Y (mm)", "origin_y_mm", 20.0)
         self._add_choice(form, "Layer", "layer", [name for name, _ in self.layer_choices], 0)
-        self._add_choice(form, "Net", "net", [name for name, _ in self.net_choices], 0)
+        self._add_choice(form, "Output", "output_mode", ["Net-tie footprint", "Board copper"], 0)
+        self._add_choice(form, "Start net", "start_net", [name for name, _ in self.net_choices], 0)
+        self._add_choice(form, "End net", "end_net", [name for name, _ in self.net_choices], 0)
         self._add_check(form, "Terminal pads", "terminal_pads", True)
         self._add_choice(form, "Pad shape", "terminal_pad_shape", ["Oval", "Round", "Rectangle"], 0)
         self._add_float(form, "Pad width (mm)", "terminal_pad_width_mm", 1.4)
@@ -282,9 +284,12 @@ class HeaterDialog(wx.Dialog):
             return
 
         inserted_count = self._insert_result(result)
+        if self._uses_net_tie_output():
+            message = "Inserted net-tie heater footprint with %d copper items on %s."
+        else:
+            message = "Inserted %d heater route items on %s."
         wx.MessageBox(
-            "Inserted %d heater route items on %s."
-            % (inserted_count, self._selected_layer_name()),
+            message % (inserted_count, self._selected_layer_name()),
             "PCB Heater Generator",
             wx.OK | wx.ICON_INFORMATION,
             parent=self,
@@ -372,6 +377,9 @@ class HeaterDialog(wx.Dialog):
             )
 
         arc_count = sum(1 for segment in result.segments if segment.kind == "arc")
+        output_line = "Output: net-tie footprint"
+        if not self._uses_net_tie_output():
+            output_line = "Output: board copper"
         lines = [
             "Target: %.3f ohm, %.1f mm trace" % (result.target_resistance_ohm, result.target_length_mm),
             "Generated: %.3f ohm, %.2f W, %.3f A" % (result.resistance_ohm, result.wattage_w, result.current_a),
@@ -385,6 +393,7 @@ class HeaterDialog(wx.Dialog):
             ),
             "Route: %d joined segments, %d arcs" % (len(result.segments), arc_count),
             "Length: %.1f mm" % result.path_length_mm,
+            output_line,
             fit_line,
         ]
         if self.controls["adaptive_fill"].GetValue():
@@ -406,6 +415,7 @@ class HeaterDialog(wx.Dialog):
 
     def _apply_control_state(self):
         outline = self._choice_value("outline").lower()
+        net_tie_output = self._uses_net_tie_output()
         adaptive = self.controls["adaptive_fill"].GetValue()
         copper_unit = self._choice_value("copper_unit").lower()
         self._sync_copper_unit(copper_unit)
@@ -423,8 +433,26 @@ class HeaterDialog(wx.Dialog):
         self.controls["trim_to_target"].SetToolTip(
             "Disabled in adaptive fill because adaptive mode uses the full outline."
         )
+        if net_tie_output:
+            self.controls["terminal_pads"].SetValue(True)
+
+        self.labels["start_net"].SetLabel("Start net" if net_tie_output else "Net")
+        self.controls["end_net"].Enable(net_tie_output)
+        self.labels["end_net"].Enable(net_tie_output)
+        self.controls["end_net"].SetToolTip(
+            "Second pad net for generated net-tie footprints."
+            if net_tie_output
+            else "Only used by net-tie footprint output."
+        )
+
         terminal_pads = self.controls["terminal_pads"].GetValue()
         pad_shape = self._choice_value("terminal_pad_shape").lower()
+        self.controls["terminal_pads"].Enable(not net_tie_output)
+        self.controls["terminal_pads"].SetToolTip(
+            "Required in net-tie footprint output because KiCad needs pads 1 and 2 for the net tie."
+            if net_tie_output
+            else ""
+        )
         self.controls["terminal_pad_shape"].Enable(terminal_pads)
         self.controls["terminal_pad_width_mm"].Enable(terminal_pads)
         self.controls["terminal_pad_length_mm"].Enable(terminal_pads and pad_shape != "round")
@@ -441,6 +469,10 @@ class HeaterDialog(wx.Dialog):
             notes.append("Height follows width/diameter for square and circle outlines.")
         if adaptive:
             notes.append("Adaptive fill uses the full outline and treats width and clearance as minimums.")
+        if net_tie_output:
+            notes.append("Net-tie output creates one footprint with pads 1 and 2 in a KiCad net-tie group.")
+            if terminal_vias:
+                notes.append("Terminal vias become plated through-hole pads inside that footprint.")
         self.mode_note.SetLabel(" ".join(notes))
         self.mode_note.Wrap(300)
         self.Layout()
@@ -490,6 +522,9 @@ class HeaterDialog(wx.Dialog):
                 "ok",
             )
             return
+        if self._uses_net_tie_output():
+            self._set_status("Ready: net-tie footprint fits inside the selected outline.", "ok")
+            return
         self._set_status("Ready: route fits inside the selected outline.", "ok")
 
     def _load_layers(self) -> List[Tuple[str, int]]:
@@ -535,18 +570,30 @@ class HeaterDialog(wx.Dialog):
         selection = self.controls["layer"].GetSelection()
         return self.layer_choices[max(selection, 0)][0]
 
-    def _selected_net(self):
-        selection = self.controls["net"].GetSelection()
+    def _selected_start_net(self):
+        selection = self.controls["start_net"].GetSelection()
         return self.net_choices[max(selection, 0)][1]
 
+    def _selected_end_net(self):
+        selection = self.controls["end_net"].GetSelection()
+        return self.net_choices[max(selection, 0)][1]
+
+    def _uses_net_tie_output(self):
+        return self._choice_value("output_mode").lower().startswith("net-tie")
+
     def _insert_result(self, result: HeaterResult) -> int:
+        if self._uses_net_tie_output():
+            return self._insert_net_tie_footprint(result)
+        return self._insert_board_copper_result(result)
+
+    def _insert_board_copper_result(self, result: HeaterResult) -> int:
         origin_x = self._float_value("origin_x_mm")
         origin_y = self._float_value("origin_y_mm")
         points = translated(result.points, origin_x, origin_y)
         segments = translated_segments(result.segments, origin_x, origin_y)
 
         layer = self._selected_layer()
-        net = self._selected_net()
+        net = self._selected_start_net()
         width_iu = self.pcbnew.FromMM(result.params.track_width_mm)
         inserted = 0
 
@@ -572,6 +619,107 @@ class HeaterDialog(wx.Dialog):
             pass
         self.pcbnew.Refresh()
         return inserted
+
+    def _insert_net_tie_footprint(self, result: HeaterResult) -> int:
+        origin_x = self._float_value("origin_x_mm")
+        origin_y = self._float_value("origin_y_mm")
+        points = translated(result.points, origin_x, origin_y)
+        segments = translated_segments(result.segments, origin_x, origin_y)
+
+        layer = self._selected_layer()
+        width_iu = self.pcbnew.FromMM(result.params.track_width_mm)
+        footprint = self._new_heater_footprint(origin_x, origin_y)
+        inserted = 0
+
+        for segment in segments:
+            if self._add_footprint_route_segment(footprint, segment, width_iu, layer):
+                inserted += 1
+
+        terminal_pads = self._terminal_pads(points)
+        if len(terminal_pads) >= 2:
+            plated_through = self.controls["terminal_vias"].GetValue()
+            if self._add_footprint_terminal_pad(
+                footprint,
+                terminal_pads[0],
+                layer,
+                self._selected_start_net(),
+                "1",
+                plated_through,
+            ):
+                inserted += 1
+            if self._add_footprint_terminal_pad(
+                footprint,
+                terminal_pads[1],
+                layer,
+                self._selected_end_net(),
+                "2",
+                plated_through,
+            ):
+                inserted += 1
+            try:
+                footprint.AddNetTiePadGroup("1,2")
+                footprint.BuildNetTieCache()
+            except Exception:
+                pass
+
+        self.board.Add(footprint)
+        try:
+            self.board.BuildConnectivity()
+        except Exception:
+            pass
+        self.pcbnew.Refresh()
+        return inserted
+
+    def _new_heater_footprint(self, origin_x, origin_y):
+        footprint = self.pcbnew.FOOTPRINT(self.board)
+        footprint.SetReference("H*")
+        footprint.SetValue("PCB_Heater_NetTie")
+        footprint.SetPosition(self._vector((origin_x, origin_y)))
+        try:
+            attributes = (
+                self.pcbnew.FP_BOARD_ONLY
+                | self.pcbnew.FP_EXCLUDE_FROM_BOM
+                | self.pcbnew.FP_EXCLUDE_FROM_POS_FILES
+                | self.pcbnew.FP_ALLOW_MISSING_COURTYARD
+            )
+            footprint.SetAttributes(attributes)
+        except Exception:
+            pass
+        try:
+            footprint.Reference().SetVisible(False)
+            footprint.Value().SetVisible(False)
+        except Exception:
+            pass
+        return footprint
+
+    def _add_footprint_route_segment(self, footprint, segment, width_iu, layer):
+        if segment.kind == "arc" and segment.mid is not None:
+            return self._add_footprint_arc(footprint, segment, width_iu, layer)
+        return self._add_footprint_track(footprint, segment.start, segment.end, width_iu, layer)
+
+    def _add_footprint_track(self, footprint, start, end, width_iu, layer):
+        if math.hypot(end[0] - start[0], end[1] - start[1]) < 0.001:
+            return False
+        shape = self.pcbnew.PCB_SHAPE(footprint, self.pcbnew.SHAPE_T_SEGMENT)
+        shape.SetStart(self._vector(start))
+        shape.SetEnd(self._vector(end))
+        shape.SetWidth(width_iu)
+        shape.SetLayer(layer)
+        footprint.Add(shape)
+        return True
+
+    def _add_footprint_arc(self, footprint, segment, width_iu, layer):
+        if segment.mid is None or math.hypot(
+            segment.end[0] - segment.start[0],
+            segment.end[1] - segment.start[1],
+        ) < 0.001:
+            return False
+        shape = self.pcbnew.PCB_SHAPE(footprint, self.pcbnew.SHAPE_T_ARC)
+        shape.SetArcGeometry(self._vector(segment.start), self._vector(segment.mid), self._vector(segment.end))
+        shape.SetWidth(width_iu)
+        shape.SetLayer(layer)
+        footprint.Add(shape)
+        return True
 
     def _add_route_segment(self, segment, width_iu, layer, net):
         if segment.kind == "arc" and segment.mid is not None:
@@ -620,6 +768,41 @@ class HeaterDialog(wx.Dialog):
         if net is not None:
             via.SetNet(net)
         self.board.Add(via)
+        return True
+
+    def _add_footprint_terminal_pad(self, footprint, terminal_pad: TerminalPad, layer, net, number, plated_through):
+        pad = self.pcbnew.PAD(footprint)
+        pad.SetName(str(number))
+        pad.SetNumber(str(number))
+        pad.SetAttribute(self.pcbnew.PAD_ATTRIB_PTH if plated_through else self.pcbnew.PAD_ATTRIB_CONN)
+        pad.SetShape(self._pad_shape_constant(terminal_pad.shape))
+
+        length_mm = terminal_pad.length_mm
+        width_mm = terminal_pad.width_mm
+        if plated_through:
+            via_diameter = self._via_diameter()
+            length_mm = max(length_mm, via_diameter)
+            width_mm = max(width_mm, via_diameter)
+            drill_iu = self.pcbnew.FromMM(self._via_drill(via_diameter))
+            pad.SetDrillSize(self.pcbnew.VECTOR2I(drill_iu, drill_iu))
+
+        pad.SetSize(
+            self.pcbnew.VECTOR2I(
+                self.pcbnew.FromMM(length_mm),
+                self.pcbnew.FromMM(width_mm),
+            )
+        )
+        pad.SetPosition(self._vector(terminal_pad.center))
+        pad.SetOrientationDegrees(terminal_pad.angle_deg)
+        if plated_through:
+            pad.SetLayerSet(pad.PTHMask())
+        else:
+            layer_set = self.pcbnew.LSET()
+            layer_set.addLayer(layer)
+            pad.SetLayerSet(layer_set)
+        if net is not None:
+            pad.SetNet(net)
+        footprint.Add(pad)
         return True
 
     def _add_terminal_pad(self, terminal_pad: TerminalPad, layer, net):
@@ -694,6 +877,8 @@ class HeaterDialog(wx.Dialog):
     def _terminal_pad_width(self):
         result = self.latest_result
         minimum = result.params.track_width_mm if result is not None else 0.01
+        if self._uses_net_tie_output() and self.controls["terminal_vias"].GetValue():
+            minimum = max(minimum, self._via_diameter())
         return max(self._float_value("terminal_pad_width_mm"), minimum)
 
     def _terminal_pad_length(self, width_mm):
